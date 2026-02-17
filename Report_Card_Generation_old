@@ -1,0 +1,266 @@
+// function showInputDialog() {
+//   var html = HtmlService.createHtmlOutputFromFile("InputForm")
+//     .setWidth(400)
+//     .setHeight(300);
+//   SpreadsheetApp.getUi().showModalDialog(html, "Enter Folder ID and File Name");
+// }
+
+// Function to process user input from HTML form
+// function processUserInput(folderId, fileName) {
+//   Logger.log(`Received Folder ID: ${folderId}, File Name: ${fileName}`);
+
+//   // **Validate input**
+//   if (!folderId || !fileName) {
+//     return "Error: Both fields are required!";
+//   }
+// generateAndEmailStudentReportCards(folderId);
+  
+// }
+
+
+function generateAndEmailStudentReportCards() {
+  const FOLDER_ID = "1zTMhM65dS8tavdGeuxMcAOlvGUw0Ynql"; // Replace with the target Google Drive folder ID
+  const folder = DriveApp.getFolderById(FOLDER_ID);
+
+  // Step 1: Locate and open the necessary files
+  const files = folder.getFiles();
+  let studentsFile, scoreCardFile;
+
+  while (files.hasNext()) {
+    const file = files.next();
+    const mime = file.getMimeType();
+    // if (file.getName().toLowerCase().includes("student details")) {
+    //   studentsFile = SpreadsheetApp.open(file);
+    // } else 
+    Logger.log(`Filename : ${file.getName()}`);
+    if (//file.getName().toLowerCase().includes("2025-26 Mazhalai-A 2nd Trimester Report Card")&&
+      mime === MimeType.GOOGLE_SHEETS) {
+      scoreCardFile = SpreadsheetApp.open(file);
+    }
+  }
+
+  // if (!studentsFile || !scoreCardFile) {
+  //   Logger.log("Required files (Students or Score Card) not found in the folder.");
+  //   return;
+  // }
+
+  if (!scoreCardFile) {
+    Logger.log("Required files Score Card not found in the folder.");
+    return;
+  }
+
+  // Step 2: Generate PDF report cards from the ATA Student Score Card file
+  generateStudentReportCards(scoreCardFile, folder);
+
+  // Step 3: Read student details and send emails from the Students file
+  //sendEmailsWithReportCards(folder, studentsFile);
+}
+
+function generateStudentReportCards(scoreCardFile, folder) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = scoreCardFile.getActiveSheet(); // Get the active sheet
+  //const folder = DriveApp.getFolderById("YOUR_FOLDER_ID_HERE"); // Change this to your Google Drive folder ID
+
+  const data = sheet.getDataRange().getValues();
+  const numRows = sheet.getLastRow();
+  const numCols = sheet.getLastColumn();
+
+  // Extract student names from Row 2, Column F onwards
+  const studentNames = data[2].slice(5); // Row 2, from Column F onwards
+  let tempSheets = [];
+
+  // Find the row index for "Comments to Parents about the student if any (Optional):"
+  let commentsRow = -1;
+  for (let i = 0; i < numRows; i++) {
+    if (data[i][1].trim() === "Comments to Parents about the student if any (Optional):") {
+      commentsRow = i;
+      break;
+    }
+  }
+  if (commentsRow === -1) {
+    Logger.log("Could not find comments section!");
+    return;
+  }
+
+  // Find the number of rows under the comments row that contain data
+  let lastRow = commentsRow + 2;
+ 
+  const numRowsAfterComments = lastRow - commentsRow; // Number of rows to merge
+
+  studentNames.forEach((student, colIndex) => {
+    if (!student) return; // Skip if student name is blank
+
+    try {
+      Logger.log(`Generating report card for student: ${student}`);
+	  
+	  // **Create a new sheet for the student**
+      const tempSheetName = `${student}_report_card`;
+      let tempSheet = ss.getSheetByName(tempSheetName);
+     
+      tempSheet = sheet.copyTo(ss);
+      tempSheet.setName(tempSheetName);
+      tempSheets.push(tempSheet); 
+
+      // Delete unnecessary columns (keep A to E and specific student's column)
+      for (let i = numCols; i >= 6; i--) {
+        if (i !== colIndex + 6) {
+          tempSheet.deleteColumn(i);
+        }
+      }
+
+      // Merge and format the comments section
+      mergeAndFormatStudentComments(tempSheet, commentsRow, numRowsAfterComments, colIndex + 6);
+
+      Utilities.sleep(2000); // **Wait 5 seconds to ensure formatting updates**
+
+    } catch (e) {
+      Logger.log(`Error generating PDF for ${student}: ${e.message}`);
+    }
+  });
+
+tempSheets.forEach((tempSheet) => {
+    try {
+      if(tempSheet.getName().includes("_report_card")){
+        const studentName = tempSheet.getName().replace("_report_card", "");
+        Logger.log(`Generating PDF for student: ${studentName}`);
+
+        const pdfBlob = exportStudentSheetToPdf(tempSheet, studentName);
+        folder.createFile(pdfBlob);
+        Logger.log(`PDF generated and saved for ${studentName}`);
+
+        Utilities.sleep(7000); 
+      }
+      
+
+    } catch (e) {
+      Logger.log(`Error generating PDF for ${tempSheet.getName()}: ${e.message}`);
+    }
+  });
+
+
+}
+
+// Function to merge and format all student comments under the comments section
+function mergeAndFormatStudentComments(sheet, commentsRow, numRowsAfterComments, studentCol) {
+
+  numRowsAfterComments = 1;
+
+  const targetRange = sheet.getRange(commentsRow + 2, 2, numRowsAfterComments, 5); // Merge A-F for all comment rows
+  Logger.log(`Target Range to Merge: ${targetRange.getA1Notation()}`);
+
+  // **Merge the target range (A-F)**
+  targetRange.mergeAcross();
+
+  // **Set the merged text**
+  targetRange.setHorizontalAlignment("center");
+  targetRange.setVerticalAlignment("middle");
+  targetRange.setFontSize(12).setFontWeight("bold");
+
+  Logger.log(`Merged and formatted comments from row ${commentsRow + 1} to ${commentsRow + numRowsAfterComments} for student column ${studentCol}.`);
+
+  const numRows = sheet.getLastRow();
+  const numCols = sheet.getLastColumn();
+   // **Step 2: Delete all rows below the comments title row**
+
+  Logger.log(`No of Rows ${numRows} rows after comments section.`);
+  Logger.log(`No of Columns ${numCols} rows after comments section.`); 
+
+  deleteEmptyColumnsAfterG(sheet); 
+  //  let deleteColumnRange = sheet.getRange(1, 7, sheet.getLastRow(), 100); // Selects F to Last Column
+  let deleteColumnRange = sheet.getRange(1, 7, 1, 500); // Selects F to Last Column
+  deleteColumnRange.deleteCells(SpreadsheetApp.Dimension.COLUMNS); // **Shift remaining cells left**
+  let deleteRowsRange = sheet.getRange(commentsRow + 4, 1, 1000 - (commentsRow + 3), 500);
+  deleteRowsRange.deleteCells(SpreadsheetApp.Dimension.ROWS);
+
+  // **Force a refresh in Google Sheets to recognize changes**
+  SpreadsheetApp.flush();
+
+  Utilities.sleep(1000);
+
+  let deleteColumnRangeForEmptyRows = sheet.getRange(commentsRow + 4, 7, 1, 100); // Selects F to Last Column
+  deleteColumnRangeForEmptyRows.deleteCells(SpreadsheetApp.Dimension.COLUMNS); // **Shift remaining cells left**
+
+   // **Force a refresh in Google Sheets to recognize changes**
+  SpreadsheetApp.flush();
+
+
+
+  Logger.log("Sheet cleanup completed.");
+}
+
+function deleteEmptyColumnsAfterG(sheet) {
+  const lastCol = sheet.getLastColumn();
+  const lastRow = sheet.getLastRow();
+
+  for (let col = lastCol; col > 7; col--) {
+    const range = sheet.getRange(1, col, lastRow);
+    const values = range.getValues().flat();
+    const isEmpty = values.every(cell => cell === "" || cell === null);
+
+    if (isEmpty) {
+      sheet.deleteColumn(col);
+      SpreadsheetApp.flush();
+      Utilities.sleep(200);
+    }
+  }
+}
+
+function addPaddingColumns(sheet) {
+  sheet.insertColumnBefore(1); // Add one blank column before A
+  sheet.insertColumnAfter(sheet.getLastColumn()); // Add one blank column after last data
+}
+
+function removePaddingColumns(sheet) {
+  sheet.deleteColumn(1); // Remove the one before A
+  sheet.deleteColumn(sheet.getLastColumn()); // Remove the one at the end
+}
+
+// Function to export sheet as PDF
+function exportStudentSheetToPdf(sheet, studentName) {
+  const spreadsheet = sheet.getParent();
+
+    // Add blank columns for simulated centering
+  // addPaddingColumns(sheet);
+
+
+  const url = `https://docs.google.com/spreadsheets/d/${spreadsheet.getId()}/export?`;
+
+  const exportOptions = {
+    format: "pdf",
+    portrait: true, // Portrait mode
+    size: "A4", // Standard PDF format
+    fitw: true, // Fit to width
+    fith: true, // Fit height-wise for single-page output
+    scale: 2, // **Forces everything onto ONE PAGE**
+    rm: 1, // Remove additional white space
+    top_margin: 0.75,
+    bottom_margin: 0.50,
+    left_margin: 0.90,
+    right_margin: 0.75,
+    printtitle: false,
+    // bottom_margin: 0, // Remove bottom margin
+    // left_margin: 0, // Remove left margin
+    // right_margin: 0, // Remove right margin
+    printtitle: false, // Do not repeat headers
+    pagenumbers: false, // Do not add page numbers
+    gridlines: false, // Hide grid lines
+    fzr: false, // Do not freeze rows
+    gid: sheet.getSheetId()
+  };
+
+  const queryString = Object.keys(exportOptions)
+    .map(key => `${key}=${exportOptions[key]}`)
+    .join("&");
+
+  const token = ScriptApp.getOAuthToken();
+  const response = UrlFetchApp.fetch(`${url}${queryString}`, {
+    headers: {
+      Authorization: `Bearer ${token}`
+    }
+  });
+
+  return response.getBlob().setName(`${studentName}.pdf`);
+}
+
+
+
