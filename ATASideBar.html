@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <style>
+      body { font-family: Arial; padding: 10px; }
+      input, textarea { width: 100%; margin: 6px 0; padding: 8px; }
+      button { padding: 10px; width: 100%; margin-top: 8px; cursor: pointer; }
+      .small { font-size: 12px; color: #555; }
+    </style>
+  </head>
+  <body>
+    <h3>ATA PDF Generator</h3>
+
+    <label>Run ONE folder ID</label>
+    <input id="folderId" placeholder="Paste Google Drive Folder ID" />
+    <button onclick="runOne()">Generate PDFs for this folder</button>
+
+    <hr/>
+
+    <label>Folder IDs to run NOW (one per line)</label>
+    <textarea id="foldersNow" rows="8"
+      placeholder="folderId1&#10;folderId2&#10;folderId3"></textarea>
+    <button onclick="runNow()">Run THESE folders now (may timeout)</button>
+    <button onclick="runAuto()">Run THESE folders (AUTO - recommended)</button>
+
+
+    <hr/>
+
+    <label>Saved Folder IDs (one per line)</label>
+    <textarea id="foldersSaved" rows="6"
+      placeholder="folderId1&#10;folderId2"></textarea>
+    <button onclick="saveFolders()">Save Folder List</button>
+    <button onclick="runSaved()">Run SAVED folders</button>
+
+    <p class="small" id="status"></p>
+
+    <script>
+      function setStatus(msg) {
+        document.getElementById("status").innerText = msg;
+      }
+
+      function runOne() {
+        const folderId = document.getElementById("folderId").value.trim();
+        if (!folderId) return setStatus("Please enter a folder ID.");
+        setStatus("Started… check Apps Script logs for progress.");
+        google.script.run.withSuccessHandler(setStatus).runFolder(folderId);
+      }
+
+      function runNow() {
+        const text = document.getElementById("foldersNow").value;
+        if (!text.trim()) return setStatus("Please paste folder IDs to run now.");
+        setStatus("Started running provided folders… check logs.");
+        google.script.run.withSuccessHandler(setStatus).runFoldersNow(text);
+      }
+
+      function saveFolders() {
+        const text = document.getElementById("foldersSaved").value;
+        setStatus("Saving…");
+        google.script.run.withSuccessHandler(setStatus).saveFolderList(text);
+      }
+
+      function runSaved() {
+        setStatus("Started running saved folders… check logs.");
+        google.script.run.withSuccessHandler(setStatus).runAllSavedFolders();
+      }
+
+      function runAuto() {
+        const text = document.getElementById("foldersNow").value;
+        if (!text.trim()) return setStatus("Please paste folder IDs to run.");
+        setStatus("Auto runner started. It will continue every 1 min until done. Check logs/Executions.");
+        google.script.run.withSuccessHandler(setStatus).startAutoRunnerForNow(text);
+      }
+
+
+      // Load saved folders on open
+      google.script.run.withSuccessHandler(function(txt){
+        document.getElementById("foldersSaved").value = txt || "";
+      }).loadFolderList();
+    </script>
+  </body>
+</html>
