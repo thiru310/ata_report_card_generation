@@ -1,0 +1,475 @@
+/************************************
+ * ATA PDF Generator
+ * - Multi Folder + UI (Sidebar) + AUTO trigger queue
+ * - Resumable per folder + spreadsheet + sheet
+ * - 429/503 backoff for PDF export
+ * - Uses OLD WORKING LOGIC: delete columns (A–E + student col) + your comment merge/cleanup
+ ************************************/
+
+// ===============================
+// MENU / SIDEBAR
+// ===============================
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("ATA")
+    .addItem("Open PDF Generator", "showAtaSidebar")
+    .addSeparator()
+    .addItem("Run Saved Folders (Auto)", "startAutoForSavedFolders")
+    .addItem("Stop Auto Runner", "stopAutoRunner")
+    .addToUi();
+}
+
+function showAtaSidebar() {
+  const html = HtmlService.createHtmlOutputFromFile("AtaSidebar")
+    .setTitle("ATA PDF Generator");
+  SpreadsheetApp.getUi().showSidebar(html);
+}
+
+function saveFolderList(text) {
+  PropertiesService.getUserProperties().setProperty("ATA_FOLDER_LIST", text || "");
+  return "Saved folder list.";
+}
+
+function loadFolderList() {
+  return PropertiesService.getUserProperties().getProperty("ATA_FOLDER_LIST") || "";
+}
+
+// ===============================
+// RUN ONE FOLDER (MANUAL)
+// ===============================
+function runFolder(folderId) {
+  try {
+    folderId = (folderId || "").trim();
+    if (!folderId) return "Please enter a folder ID.";
+    generateReportCardsForFolder_(folderId);
+    return "Finished folder (completed or resumed). Check logs for details.";
+  } catch (e) {
+    return "Folder failed: " + (e && e.message ? e.message : e);
+  }
+}
+
+// ===============================
+// AUTO RUN MANY FOLDERS (QUEUE + TRIGGER)
+// ===============================
+function startAutoRunnerForNow(folderIdsText) {
+  const folderIds = parseFolderIds_(folderIdsText);
+  if (folderIds.length === 0) return "No folder IDs provided.";
+
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty("ATA_QUEUE_FOLDER_IDS", JSON.stringify(folderIds));
+  props.setProperty("ATA_QUEUE_INDEX", "0");
+  props.setProperty("ATA_QUEUE_STATUS", "RUNNING");
+  props.deleteProperty("ATA_QUEUE_LAST_MSG");
+
+  createOrResetAutoTrigger_();
+
+  // Run immediately once
+  processNextFolderFromQueue_();
+
+  return `Auto runner started for ${folderIds.length} folders. It will continue automatically until done.`;
+}
+
+function startAutoForSavedFolders() {
+  const saved = loadFolderList();
+  return startAutoRunnerForNow(saved);
+}
+
+function processNextFolderFromQueue_() {
+  const props = PropertiesService.getScriptProperties();
+
+  if (props.getProperty("ATA_QUEUE_STATUS") !== "RUNNING") {
+    Logger.log("Auto runner is not running.");
+    return;
+  }
+
+  const folderIds = JSON.parse(props.getProperty("ATA_QUEUE_FOLDER_IDS") || "[]");
+  let idx = parseInt(props.getProperty("ATA_QUEUE_INDEX") || "0", 10);
+
+  if (idx >= folderIds.length) {
+    props.setProperty("ATA_QUEUE_STATUS", "DONE");
+    props.setProperty("ATA_QUEUE_LAST_MSG", `DONE: processed all ${folderIds.length} folders.`);
+    stopAutoRunner();
+    Logger.log("Auto runner complete.");
+    return;
+  }
+
+  const folderId = folderIds[idx];
+  Logger.log(`=== Running folder (AUTO): ${idx + 1}/${folderIds.length} => ${folderId} ===`);
+
+  try {
+    generateReportCardsForFolder_(folderId);
+    props.setProperty("ATA_QUEUE_LAST_MSG", `Completed folder ${idx + 1}/${folderIds.length}`);
+  } catch (e) {
+    const msg = (e && e.message ? e.message : String(e));
+    Logger.log("Folder failed: " + folderId + " -> " + msg);
+    props.setProperty("ATA_QUEUE_LAST_MSG", `FAILED folder ${idx + 1}/${folderIds.length}: ${msg}`);
+  } finally {
+    props.setProperty("ATA_QUEUE_INDEX", String(idx + 1));
+  }
+
+  createOrResetAutoTrigger_();
+}
+
+function stopAutoRunner() {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty("ATA_QUEUE_STATUS", "STOPPED");
+  deleteAutoTriggers_();
+  return "Auto runner stopped.";
+}
+
+function createOrResetAutoTrigger_() {
+  const triggers = ScriptApp.getProjectTriggers();
+  const exists = triggers.some(t => t.getHandlerFunction() === "processNextFolderFromQueue_");
+  if (exists) return;
+
+  ScriptApp.newTrigger("processNextFolderFromQueue_")
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+}
+
+function deleteAutoTriggers_() {
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(t => {
+    if (t.getHandlerFunction() === "processNextFolderFromQueue_") {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+}
+
+function parseFolderIds_(text) {
+  return (text || "")
+    .split(/\r?\n/)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+// ===============================
+// CORE: PER FOLDER
+// ===============================
+function generateReportCardsForFolder_(folderId) {
+  const folder = DriveApp.getFolderById(folderId);
+
+  const scoreCardFile = openScoreCardFileFromFolder_(folder);
+  if (!scoreCardFile) {
+    Logger.log("Score Card file not found in folder: " + folderId);
+    return;
+  }
+
+  generateStudentReportCards_RESUMABLE_CORE_(scoreCardFile, folder);
+}
+
+function openScoreCardFileFromFolder_(folder) {
+  const files = folder.getFiles();
+  while (files.hasNext()) {
+    const f = files.next();
+    if (f.getMimeType() === MimeType.GOOGLE_SHEETS) {
+      Logger.log("Using score card file: " + f.getName());
+      return SpreadsheetApp.open(f);
+    }
+  }
+  return null;
+}
+
+// ===============================
+// CORE: PER SPREADSHEET (RESUMABLE)
+// ===============================
+function generateStudentReportCards_RESUMABLE_CORE_(scoreCardFile, folder) {
+  const props = PropertiesService.getScriptProperties();
+
+  const ss = scoreCardFile;              // IMPORTANT: operate inside this spreadsheet
+  const sourceSheet = ss.getActiveSheet();
+
+  const data = sourceSheet.getDataRange().getValues();
+  const numRows = sourceSheet.getLastRow();
+  const numCols = sourceSheet.getLastColumn();
+
+  // ----- CONFIG -----
+  const STUDENT_NAMES_ROW_INDEX_ZERO_BASED = 2; // data[2]
+  const STUDENT_NAMES_START_COL_ZERO_BASED = 5; // from column F onward
+  const COMMENTS_LABEL_TEXT = "Comments to Parents about the student if any (Optional):";
+
+  const SUCCESS_PACING_MS = 1500;
+  const SHEET_OP_PACING_MS = 250;
+
+  const studentNames = ((data[STUDENT_NAMES_ROW_INDEX_ZERO_BASED] || [])
+    .slice(STUDENT_NAMES_START_COL_ZERO_BASED))
+    .map(v => (v ? String(v).trim() : ""));
+
+  // Find comments row (column B => index 1)
+  let commentsRowZeroBased = -1;
+  for (let r = 0; r < numRows; r++) {
+    const cell = data[r][1];
+    if (cell && String(cell).trim() === COMMENTS_LABEL_TEXT) {
+      commentsRowZeroBased = r;
+      break;
+    }
+  }
+  if (commentsRowZeroBased === -1) {
+    Logger.log("Could not find comments section label row.");
+    return;
+  }
+
+  // Resume key per folder+spreadsheet+sheet
+  const resumeKey = `ATA_RESUME_${folder.getId()}_${ss.getId()}_${sourceSheet.getSheetId()}`;
+  const startIndex = parseInt(props.getProperty(resumeKey) || "0", 10);
+
+  Logger.log(`Spreadsheet: ${ss.getName()}`);
+  Logger.log(`Sheet: ${sourceSheet.getName()}`);
+  Logger.log(`Target folder: ${folder.getName()} (${folder.getId()})`);
+  Logger.log(`Total students (including blanks): ${studentNames.length}`);
+  Logger.log(`Resuming from index: ${startIndex}`);
+
+  let processed = 0;
+  let failures = JSON.parse(props.getProperty(resumeKey + ":failures") || "[]");
+
+  for (let i = startIndex; i < studentNames.length; i++) {
+    const student = studentNames[i];
+
+    // advance pointer every iteration
+    props.setProperty(resumeKey, String(i + 1));
+
+    if (!student) continue;
+
+    const studentColOneBased = i + 6; // student column in original sheet (F=6)
+    const safeStudentName = sanitizeFileName_(student);
+    const safeSheetName = makeSafeSheetName_(student) + "_report_card";
+    const targetPdfName = `${safeStudentName}.pdf`;
+
+    if (pdfAlreadyExists_(folder, targetPdfName)) {
+      Logger.log(`Skipping ${student} because PDF exists: ${targetPdfName}`);
+      continue;
+    }
+
+    let tempSheet = null;
+
+    try {
+      Logger.log(`Generating report card for: ${student}`);
+
+      // Copy source sheet into SAME spreadsheet
+      tempSheet = sourceSheet.copyTo(ss).setName(safeSheetName);
+
+      // Make sure nothing is hidden (important!)
+      try {
+        tempSheet.showColumns(1, tempSheet.getMaxColumns());
+        tempSheet.showRows(1, tempSheet.getMaxRows());
+      } catch (e) {
+        // ignore
+      }
+
+      // OLD WORKING BEHAVIOR:
+      // Delete all columns from F..end except the student's column.
+      deleteOtherStudentColumns_(tempSheet, numCols, studentColOneBased);
+
+      // Run your proven merge+cleanup logic (commentsRowZeroBased)
+      const numRowsAfterComments = 1; // same as your code
+      mergeAndFormatStudentComments(tempSheet, commentsRowZeroBased, numRowsAfterComments, studentColOneBased);
+
+      SpreadsheetApp.flush();
+      Utilities.sleep(SHEET_OP_PACING_MS);
+
+      // Export PDF (429 safe)
+      const pdfBlob = exportStudentSheetToPdf429Safe_(tempSheet, safeStudentName);
+      folder.createFile(pdfBlob);
+
+      Logger.log(`PDF saved for ${student}`);
+
+      processed++;
+      Utilities.sleep(SUCCESS_PACING_MS);
+
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e);
+      Logger.log(`Error for ${student}: ${msg}`);
+
+      failures.push({
+        folderId: folder.getId(),
+        folderName: folder.getName(),
+        spreadsheetId: ss.getId(),
+        sheetId: sourceSheet.getSheetId(),
+        student: student,
+        index: i,
+        error: msg,
+        ts: new Date().toISOString()
+      });
+      props.setProperty(resumeKey + ":failures", JSON.stringify(failures));
+
+    } finally {
+      if (tempSheet) {
+        try { ss.deleteSheet(tempSheet); }
+        catch (err) { Logger.log("Temp sheet delete failed (ignored): " + err.message); }
+      }
+    }
+  }
+
+  Logger.log(`Done. PDFs created in this run: ${processed}`);
+  Logger.log(`Failures so far: ${failures.length}`);
+  Logger.log("If failures exist or throttling happened, rerun. Resume will continue.");
+
+  props.deleteProperty(resumeKey);
+}
+
+// ===============================
+// OLD WORKING HELPERS
+// ===============================
+function deleteOtherStudentColumns_(sheet, originalNumCols, studentColToKeep) {
+  // Delete from last column down to F (6), keep only student's column
+  // Deleting from right to left avoids index shifting problems.
+  for (let c = originalNumCols; c >= 6; c--) {
+    if (c !== studentColToKeep) {
+      sheet.deleteColumn(c);
+    }
+  }
+}
+
+// Your original working merge+cleanup (unchanged logic)
+function mergeAndFormatStudentComments(sheet, commentsRow, numRowsAfterComments, studentCol) {
+  numRowsAfterComments = 1;
+
+  const targetRange = sheet.getRange(commentsRow + 2, 2, numRowsAfterComments, 5); // B:F
+  Logger.log(`Target Range to Merge: ${targetRange.getA1Notation()}`);
+
+  targetRange.mergeAcross();
+
+  targetRange.setHorizontalAlignment("center");
+  targetRange.setVerticalAlignment("middle");
+  targetRange.setFontSize(12).setFontWeight("bold");
+  targetRange.setWrap(true);
+
+  Logger.log(`Merged and formatted comments from row ${commentsRow + 1} to ${commentsRow + numRowsAfterComments} for student column ${studentCol}.`);
+
+  const numRows = sheet.getLastRow();
+  const numCols = sheet.getLastColumn();
+
+  Logger.log(`No of Rows ${numRows} rows after comments section.`);
+  Logger.log(`No of Columns ${numCols} rows after comments section.`);
+
+  deleteEmptyColumnsAfterG(sheet);
+
+  let deleteColumnRange = sheet.getRange(1, 7, 1, 500); // G to far right
+  deleteColumnRange.deleteCells(SpreadsheetApp.Dimension.COLUMNS);
+
+  let deleteRowsRange = sheet.getRange(commentsRow + 4, 1, 1000 - (commentsRow + 3), 500);
+  deleteRowsRange.deleteCells(SpreadsheetApp.Dimension.ROWS);
+
+  SpreadsheetApp.flush();
+  Utilities.sleep(1000);
+
+  let deleteColumnRangeForEmptyRows = sheet.getRange(commentsRow + 4, 7, 1, 100);
+  deleteColumnRangeForEmptyRows.deleteCells(SpreadsheetApp.Dimension.COLUMNS);
+
+  SpreadsheetApp.flush();
+  Logger.log("Sheet cleanup completed.");
+}
+
+function deleteEmptyColumnsAfterG(sheet) {
+  const lastCol = sheet.getLastColumn();
+  const lastRow = sheet.getLastRow();
+
+  for (let col = lastCol; col > 7; col--) {
+    const range = sheet.getRange(1, col, lastRow);
+    const values = range.getValues().flat();
+    const isEmpty = values.every(cell => cell === "" || cell === null);
+
+    if (isEmpty) {
+      sheet.deleteColumn(col);
+      SpreadsheetApp.flush();
+      Utilities.sleep(200);
+    }
+  }
+}
+
+// ===============================
+// PDF EXPORT (429 SAFE)
+// ===============================
+function exportStudentSheetToPdf429Safe_(sheet, studentName) {
+  const spreadsheet = sheet.getParent();
+  const url = `https://docs.google.com/spreadsheets/d/${spreadsheet.getId()}/export?`;
+
+  // Match your old export options closely
+  const exportOptions = {
+    format: "pdf",
+    portrait: true,
+    size: "A4",
+    fitw: true,
+    fith: true,
+    scale: 2,
+    rm: 1,
+    top_margin: 0.75,
+    bottom_margin: 0.50,
+    left_margin: 0.90,
+    right_margin: 0.75,
+    printtitle: false,
+    pagenumbers: false,
+    gridlines: false,
+    fzr: false,
+    gid: sheet.getSheetId()
+  };
+
+  const queryString = Object.keys(exportOptions)
+    .map(k => `${k}=${encodeURIComponent(exportOptions[k])}`)
+    .join("&");
+
+  const token = ScriptApp.getOAuthToken();
+
+  const maxAttempts = 8;
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const resp = UrlFetchApp.fetch(`${url}${queryString}`, {
+        headers: { Authorization: `Bearer ${token}` },
+        muteHttpExceptions: true
+      });
+
+      const code = resp.getResponseCode();
+      if (code >= 200 && code < 300) {
+        return resp.getBlob().setName(`${studentName}.pdf`);
+      }
+
+      if (code === 429 || code === 503) {
+        const baseMs = Math.min(30000, Math.pow(2, attempt) * 1000);
+        const jitterMs = Math.floor(Math.random() * 750);
+        const sleepMs = baseMs + jitterMs;
+        Logger.log(`PDF export attempt ${attempt} got HTTP ${code}. Sleeping ${sleepMs}ms then retry...`);
+        Utilities.sleep(sleepMs);
+        continue;
+      }
+
+      lastErr = new Error(`HTTP ${code}: ${resp.getContentText().slice(0, 200)}`);
+      break;
+
+    } catch (e) {
+      lastErr = e;
+      const baseMs = Math.min(30000, Math.pow(2, attempt) * 1000);
+      const jitterMs = Math.floor(Math.random() * 750);
+      const sleepMs = baseMs + jitterMs;
+      Logger.log(`PDF export attempt ${attempt} error: ${e.message}. Sleeping ${sleepMs}ms then retry...`);
+      Utilities.sleep(sleepMs);
+    }
+  }
+
+  throw new Error(`PDF export failed after retries. Last error: ${lastErr ? lastErr.message : "unknown"}`);
+}
+
+// ===============================
+// UTILITIES
+// ===============================
+function sanitizeFileName_(name) {
+  return String(name)
+    .replace(/[\/\\:\*\?"<>\|]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function makeSafeSheetName_(name) {
+  return String(name)
+    .replace(/[\[\]\:\*\?\/\\]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .substring(0, 80);
+}
+
+function pdfAlreadyExists_(folder, fileName) {
+  const files = folder.getFilesByName(fileName);
+  return files.hasNext();
+}
